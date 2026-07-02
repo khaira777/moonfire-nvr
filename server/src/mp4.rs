@@ -746,16 +746,29 @@ impl Slice {
     }
 
     fn wrap_video_sample_entry(&self, f: &File, r: Range<u64>, len: u64) -> Result<Chunk, Error> {
-        let mp4 = ARefss::new(f.0.clone());
-        Ok(mp4
-            .try_map(|mp4| {
-                let data = &mp4.video_sample_entries[self.p()].1.data;
-                if u64::try_from(data.len()).unwrap() != len {
-                    bail!(Internal, msg("expected len {} got len {}", len, data.len()));
-                }
-                Ok::<_, Error>(&data[r.start as usize..r.end as usize])
-            })?
-            .into())
+        let data = &f.0.video_sample_entries[self.p()].1.data;
+        if u64::try_from(data.len()).unwrap() != len {
+            bail!(Internal, msg("expected len {} got len {}", len, data.len()));
+        }
+
+        // ponytail: hvc1→hev1 for Safari compat. Camera SDP sends hvc1,
+        // Safari only decodes hev1. Same bitstream, different box name.
+        // Rewrite the box type bytes at offset 4-7 from hvc1 to hev1.
+        if data.len() >= 8 && &data[4..8] == b"hvc1" {
+            let mut modified = data.to_vec();
+            modified[4..8].copy_from_slice(b"hev1");
+            // Return an owned Chunk to avoid use-after-free with ARefss::try_map.
+            // The modified Vec is owned by the Chunk, so it stays alive.
+            Ok(Chunk::from(modified))
+        } else {
+            let mp4 = ARefss::new(f.0.clone());
+            Ok(mp4
+                .try_map(|mp4| {
+                    let data = &mp4.video_sample_entries[self.p()].1.data;
+                    Ok::<_, Error>(&data[r.start as usize..r.end as usize])
+                })?
+                .into())
+        }
     }
 }
 
@@ -1956,7 +1969,14 @@ impl http_serve::Entity for File {
             } else {
                 mime.extend_from_slice(b", ");
             }
-            mime.extend_from_slice(e.1.rfc6381_codec.as_bytes());
+            // ponytail: hvc1→hev1 for Safari compat. Camera SDP sends hvc1,
+            // Safari only decodes hev1. Same bitstream, different box name.
+            if e.1.rfc6381_codec.starts_with("hvc1") {
+                let replaced = e.1.rfc6381_codec.replacen("hvc1", "hev1", 1);
+                mime.extend_from_slice(replaced.as_bytes());
+            } else {
+                mime.extend_from_slice(e.1.rfc6381_codec.as_bytes());
+            }
         }
         mime.extend_from_slice(b"\"");
         hdrs.insert(
@@ -2779,6 +2799,108 @@ mod tests {
         mp4.add_headers(&mut hdrs);
         assert_eq!(hdrs.get("X-Aspect").unwrap(), "16:9");
         traverse(mp4.clone()).await;
+    }
+
+    /// Tests that H.265 (HEVC) sample entries with hvc1 codec are rewritten to hev1
+    /// for Safari/WebKit compatibility.
+    #[tokio::test]
+    async fn test_hvc1_to_hev1_rewrite() {
+        testutil::init();
+        let db = TestDb::new(RealClocks {}).await;
+
+        // Create a sample entry with hvc1 codec (typical from RTSP SDP)
+        // The data blob has hvc1 at bytes 4-7 (after the 4-byte size field)
+        let mut data = vec![0u8; 100];
+        data[4..8].copy_from_slice(b"hvc1"); // Box type at offset 4-7
+
+        let ent = {
+            let l = db.db.lock();
+            let mut l = l.sample_entries().lock();
+            let id = l
+                .insert_video(db::sample_entries::Video {
+                    width: 2560,
+                    height: 1440,
+                    pasp_h_spacing: 1,
+                    pasp_v_spacing: 1,
+                    data,
+                    rfc6381_codec: "hvc1.1.6.L150.00".to_owned(),
+                })
+                .unwrap();
+            l.get_video(id).unwrap().clone()
+        };
+
+        // Build init segment
+        let mut builder = FileBuilder::new(Type::InitSegment);
+        builder.append_video_sample_entry(ent);
+        let mp4 = builder.build(db.db.clone()).unwrap();
+
+        // Verify Content-Type header uses hev1 (not hvc1)
+        let mut hdrs = http::header::HeaderMap::new();
+        mp4.add_headers(&mut hdrs);
+        let content_type = hdrs.get(http::header::CONTENT_TYPE).unwrap().to_str().unwrap();
+        assert!(
+            content_type.contains("hev1"),
+            "Content-Type should contain hev1, got: {}",
+            content_type
+        );
+        assert!(
+            !content_type.contains("hvc1"),
+            "Content-Type should not contain hvc1, got: {}",
+            content_type
+        );
+
+        // Verify MP4 is valid by traversing all boxes
+        traverse(mp4).await;
+    }
+
+    /// Tests that H.264 (AVC) sample entries are unaffected by the hvc1→hev1 rewrite.
+    #[tokio::test]
+    async fn test_avc1_unaffected() {
+        testutil::init();
+        let db = TestDb::new(RealClocks {}).await;
+
+        // Create a sample entry with avc1 codec
+        let mut data = vec![0u8; 100];
+        data[4..8].copy_from_slice(b"avc1"); // Box type at offset 4-7
+
+        let ent = {
+            let l = db.db.lock();
+            let mut l = l.sample_entries().lock();
+            let id = l
+                .insert_video(db::sample_entries::Video {
+                    width: 1920,
+                    height: 1080,
+                    pasp_h_spacing: 1,
+                    pasp_v_spacing: 1,
+                    data,
+                    rfc6381_codec: "avc1.4d0029".to_owned(),
+                })
+                .unwrap();
+            l.get_video(id).unwrap().clone()
+        };
+
+        // Build init segment
+        let mut builder = FileBuilder::new(Type::InitSegment);
+        builder.append_video_sample_entry(ent);
+        let mp4 = builder.build(db.db.clone()).unwrap();
+
+        // Verify Content-Type header uses avc1 (unchanged)
+        let mut hdrs = http::header::HeaderMap::new();
+        mp4.add_headers(&mut hdrs);
+        let content_type = hdrs.get(http::header::CONTENT_TYPE).unwrap().to_str().unwrap();
+        assert!(
+            content_type.contains("avc1"),
+            "Content-Type should contain avc1, got: {}",
+            content_type
+        );
+        assert!(
+            !content_type.contains("hev1"),
+            "Content-Type should not contain hev1 for avc1 streams, got: {}",
+            content_type
+        );
+
+        // Verify MP4 is valid by traversing all boxes
+        traverse(mp4).await;
     }
 
     #[tokio::test]
