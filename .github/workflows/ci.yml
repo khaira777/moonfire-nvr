@@ -69,7 +69,7 @@ jobs:
           node-version: ${{ matrix.node }}
       # Install pnpm then use pnpm instead npm
       - run: npm i -g pnpm
-      - run: cd ui && pnpm i --frozen-lockfile
+      - run: cd ui && pnpm i --frozen-lockfile --config.onlyBuiltDependenciesFile=""
       - run: cd ui && pnpm run build
       - run: cd ui && pnpm run test
       - run: cd ui && pnpm run lint

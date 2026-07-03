@@ -3245,7 +3245,185 @@ mod tests {
         drop(db.flusher_channel);
         db.flusher_join.await.unwrap();
     }
+
+    #[test]
+    fn test_strip_hevc_param_nals() {
+        // Construct some NAL units:
+        // NAL 1: Type 32 (VPS), length 5
+        // NAL 2: Type 19 (IDR), length 10
+        // NAL 3: Type 33 (SPS), length 3
+        // NAL 4: Type 1 (non-IDR/TRAIL), length 8
+        let mut sample = Vec::new();
+
+        // NAL 1: Type 32 (VPS). Byte: 32 << 1 = 64 (0x40)
+        sample.extend_from_slice(&5u32.to_be_bytes());
+        sample.extend_from_slice(&[0x40, 0x01, 0x02, 0x03, 0x04]);
+
+        // NAL 2: Type 19 (IDR). Byte: 19 << 1 = 38 (0x26)
+        sample.extend_from_slice(&10u32.to_be_bytes());
+        sample.extend_from_slice(&[0x26, 0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08]);
+
+        // NAL 3: Type 33 (SPS). Byte: 33 << 1 = 66 (0x42)
+        sample.extend_from_slice(&3u32.to_be_bytes());
+        sample.extend_from_slice(&[0x42, 0x00, 0x01]);
+
+        // NAL 4: Type 1 (TRAIL_R). Byte: 1 << 1 = 2 (0x02)
+        sample.extend_from_slice(&8u32.to_be_bytes());
+        sample.extend_from_slice(&[0x02, 0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06]);
+
+        let (filtered, removed) = strip_hevc_param_nals(&sample);
+
+        // We expect NAL 1 (9 bytes) and NAL 3 (7 bytes) to be removed.
+        // Total removed = 9 + 7 = 16 bytes.
+        assert_eq!(removed, 16);
+
+        // We expect filtered to contain NAL 2 and NAL 4.
+        let mut expected = Vec::new();
+        expected.extend_from_slice(&10u32.to_be_bytes());
+        expected.extend_from_slice(&[0x26, 0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08]);
+        expected.extend_from_slice(&8u32.to_be_bytes());
+        expected.extend_from_slice(&[0x02, 0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06]);
+
+        assert_eq!(filtered, expected);
+    }
+
+    #[tokio::test]
+    async fn test_hevc_serve_time_filtering() {
+        testutil::init();
+        let db = TestDb::new(RealClocks {}).await;
+
+        // 1. Insert an hvc1 sample entry
+        let mut sample_entry_data = vec![0u8; 100];
+        sample_entry_data[4..8].copy_from_slice(b"hvc1");
+
+        let video_sample_entry_id = {
+            let l = db.db.lock();
+            let mut entries = l.sample_entries().lock();
+            entries.insert_video(db::sample_entries::Video {
+                    width: 1920,
+                    height: 1080,
+                    pasp_h_spacing: 1,
+                    pasp_v_spacing: 1,
+                    data: sample_entry_data,
+                    rfc6381_codec: "hvc1.1.6.L150.00".to_owned(),
+                })
+                .unwrap()
+        };
+
+        // 2. Setup the stream and writer
+        let stream = {
+            let l = db.db.lock();
+            l.streams_by_id().get(&TEST_STREAM_ID).unwrap().clone()
+        };
+        let mut output = writer::Writer::new(stream).unwrap();
+
+        // 3. Construct frames
+        // Frame 1: Keyframe with VPS (type 32), SPS (type 33), PPS (type 34), IDR (type 19)
+        let mut frame1_data = Vec::new();
+        // VPS: length 2, type 32 (0x40)
+        frame1_data.extend_from_slice(&2u32.to_be_bytes());
+        frame1_data.extend_from_slice(&[0x40, 0x01]);
+        // SPS: length 3, type 33 (0x42)
+        frame1_data.extend_from_slice(&3u32.to_be_bytes());
+        frame1_data.extend_from_slice(&[0x42, 0x01, 0x02]);
+        // PPS: length 2, type 34 (0x44)
+        frame1_data.extend_from_slice(&2u32.to_be_bytes());
+        frame1_data.extend_from_slice(&[0x44, 0x01]);
+        // IDR: length 4, type 19 (0x26)
+        frame1_data.extend_from_slice(&4u32.to_be_bytes());
+        frame1_data.extend_from_slice(&[0x26, 0xaa, 0xbb, 0xcc]);
+
+        // Expected filtered Frame 1 data: only the IDR NAL unit (8 bytes: 4 bytes length + 4 bytes payload)
+        let mut expected_frame1_filtered = Vec::new();
+        expected_frame1_filtered.extend_from_slice(&4u32.to_be_bytes());
+        expected_frame1_filtered.extend_from_slice(&[0x26, 0xaa, 0xbb, 0xcc]);
+
+        // Frame 2: Non-keyframe, TRAIL (type 1)
+        let mut frame2_data = Vec::new();
+        // TRAIL: length 4, type 1 (0x02)
+        frame2_data.extend_from_slice(&4u32.to_be_bytes());
+        frame2_data.extend_from_slice(&[0x02, 0x11, 0x22, 0x33]);
+
+        const START_TIME: recording::Time = recording::Time(1430006400i64 * TIME_UNITS_PER_SEC);
+
+        // Write frame 1 (keyframe)
+        output.write(
+            frame1_data,
+            START_TIME,
+            START_TIME.0,
+            true, // is_key
+            false,
+            video_sample_entry_id,
+        ).unwrap();
+
+        // Write frame 2 (non-keyframe)
+        output.write(
+            frame2_data.clone(),
+            START_TIME + recording::Duration(3000),
+            (START_TIME + recording::Duration(3000)).0,
+            false, // is_key
+            false,
+            video_sample_entry_id,
+        ).unwrap();
+
+        output.close("done".into());
+        db.flusher_channel.await_idle().await;
+
+        // Wait for the sample file to exist and have non-zero size.
+        let mut file_ready = false;
+        let file_path = db.tmpdir.path().join("0000000100000000");
+        for _ in 0..100 {
+            if let Ok(metadata) = std::fs::metadata(&file_path) {
+                if metadata.len() > 0 {
+                    file_ready = true;
+                    break;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert!(file_ready, "sample file was not written to disk in time");
+
+        // 4. Build MP4
+        let mut builder = FileBuilder::new(Type::Normal);
+        let all_time = recording::Time(i64::MIN)..recording::Time(i64::MAX);
+        {
+            let ldb = db.db.lock();
+            ldb.list_recordings_by_time(TEST_STREAM_ID, all_time, &mut |r| {
+                builder.append(&ldb, &r, 0..r.media_duration_90k, true).unwrap();
+                Ok(())
+            }).unwrap();
+        }
+
+        let mp4 = builder.build(db.db.clone()).unwrap();
+
+        // 5. Verify the served sample data has the parameters stripped
+        let inner = mp4.0.clone();
+
+        // Let's check filtered_samples
+        assert!(inner.filtered_samples.len() >= 1);
+        let filtered_seg = inner.filtered_samples[0].as_ref().expect("segment should be filtered");
+        assert_eq!(filtered_seg.len(), 2);
+        assert_eq!(filtered_seg[0].data, expected_frame1_filtered);
+        assert_eq!(filtered_seg[0].original_bytes, 27); // (4+2) + (4+3) + (4+2) + (4+4) = 27
+        assert_eq!(filtered_seg[1].data, frame2_data);
+        assert_eq!(filtered_seg[1].original_bytes, 8); // 4 + 4 = 8
+
+        // Verify served range data from get_video_sample_data
+        let stream_slice = inner.get_video_sample_data(0, 0..8); // IDR frame size is 8
+        let mut served_data = vec![0u8; 8];
+        match stream_slice {
+            SliceStream::Once(Some(Ok(chunk))) => {
+                served_data.copy_from_slice(chunk.chunk());
+            }
+            _ => panic!("Expected SliceStream::Once with chunk"),
+        }
+        assert_eq!(served_data, expected_frame1_filtered);
+
+        drop(db.flusher_channel);
+        db.flusher_join.await.unwrap();
+    }
 }
+
 
 #[cfg(all(test, feature = "nightly"))]
 mod bench {
