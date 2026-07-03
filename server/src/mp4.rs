@@ -1079,6 +1079,15 @@ impl FileBuilder {
             let is_hevc = self.video_sample_entries.iter().any(|e| {
                 e.0 == vse_id && e.1.data.len() >= 8 && &e.1.data[4..8] == b"hvc1"
             });
+            debug!(
+                "HEVC filter check: vse_id={}, is_hevc={}, entries={:?}",
+                vse_id,
+                is_hevc,
+                self.video_sample_entries.iter().map(|e| {
+                    let fourcc = e.1.data.get(4..8).map(|b| String::from_utf8_lossy(b).to_string());
+                    (e.0, e.1.data.len(), fourcc)
+                }).collect::<Vec<_>>()
+            );
             if !is_hevc {
                 self.filtered_samples.push(None);
                 continue;
