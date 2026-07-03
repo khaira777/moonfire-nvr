@@ -79,6 +79,39 @@ use std::task::{ready, Poll};
 use std::time::SystemTime;
 use tracing::{debug, trace, warn};
 
+/// Pre-filtered frame data for HEVC streams with in-band parameter sets.
+/// Stores the filtered data (VPS/SPS/PPS removed) alongside the original size
+/// so metadata can be computed correctly.
+struct FilteredFrame {
+    data: Vec<u8>,
+    original_bytes: u32,
+}
+
+/// Strips H.265 VPS (32), SPS (33), PPS (34) NAL units from a sample.
+/// Samples use 4-byte big-endian length-prefixed NAL units (AVCC/HVC format).
+/// Returns (filtered_data, bytes_removed).
+fn strip_hevc_param_nals(sample: &[u8]) -> (Vec<u8>, u32) {
+    let mut out = Vec::with_capacity(sample.len());
+    let mut removed: u32 = 0;
+    let mut pos = 0;
+    while pos + 4 <= sample.len() {
+        let nalu_len = u32::from_be_bytes(sample[pos..pos + 4].try_into().unwrap()) as usize;
+        if pos + 4 + nalu_len > sample.len() {
+            break;
+        }
+        let nal_type = (sample[pos + 4] >> 1) & 0x3F;
+        if nal_type == 32 || nal_type == 33 || nal_type == 34 {
+            // VPS/SPS/PPS — strip
+            removed += (4 + nalu_len) as u32;
+        } else {
+            // Keep
+            out.extend_from_slice(&sample[pos..pos + 4 + nalu_len]);
+        }
+        pos += 4 + nalu_len;
+    }
+    (out, removed)
+}
+
 /// This value should be incremented any time a change is made to this file that causes different
 /// bytes or headers to be output for a particular set of `FileBuilder` options. Incrementing this
 /// value will cause the etag to change as well.
@@ -337,6 +370,10 @@ struct Segment {
     /// The 1-indexed frame number in the `File` of the first frame in this segment.
     first_frame_num: u32,
     num_subtitle_samples: u16,
+
+    /// Per-frame filtered sizes for HEVC segments with in-band parameter sets.
+    /// When present, `build_index` and `truns` use these instead of the original sizes.
+    filtered_sample_sizes: Option<Vec<u32>>,
 }
 
 // Manually implement `Debug` skipping the obnoxiously-long `index` field.
@@ -378,6 +415,7 @@ impl Segment {
             index: OnceLock::new(),
             first_frame_num,
             num_subtitle_samples: 0,
+            filtered_sample_sizes: None,
         })
     }
 
@@ -460,7 +498,10 @@ impl Segment {
                     &mut stts[8 * frame + 4..8 * frame + 8],
                     it.duration_90k as u32,
                 );
-                BigEndian::write_u32(&mut stsz[4 * frame..4 * frame + 4], it.bytes);
+                let bytes = self.filtered_sample_sizes.as_ref()
+                    .map(|sizes| sizes[frame])
+                    .unwrap_or(it.bytes);
+                BigEndian::write_u32(&mut stsz[4 * frame..4 * frame + 4], bytes);
                 if it.is_key() {
                     BigEndian::write_u32(
                         &mut stss[4 * key_frame..4 * key_frame + 4],
@@ -512,6 +553,7 @@ impl Segment {
         }
         let mut run_info: Option<RunInfo> = None;
         let mut data_pos = initial_pos;
+        let mut frame_idx: usize = 0;
         self.s
             .foreach(playback, |it| {
                 let is_key = it.is_key();
@@ -583,9 +625,13 @@ impl Segment {
                 r.count += 1;
                 r.last_start = it.start_90k;
                 r.last_dur = it.duration_90k;
+                let bytes = self.filtered_sample_sizes.as_ref()
+                    .and_then(|sizes| sizes.get(frame_idx).copied())
+                    .unwrap_or(it.bytes);
                 v.write_u32::<BigEndian>(it.duration_90k as u32)?;
-                v.write_u32::<BigEndian>(it.bytes)?;
-                data_pos += it.bytes as u64;
+                v.write_u32::<BigEndian>(bytes)?;
+                data_pos += bytes as u64;
+                frame_idx += 1;
                 run_info = Some(r);
                 Ok(())
             })
@@ -643,6 +689,10 @@ pub struct FileBuilder {
     prev_media_duration_and_cur_runs: Option<(recording::Duration, i32)>,
     include_timestamp_subtitle_track: bool,
     content_disposition: Option<HeaderValue>,
+
+    /// Per-segment filtered sample data for HEVC with in-band parameter sets.
+    /// Transferred to FileInner during build.
+    filtered_samples: Vec<Option<Vec<FilteredFrame>>>,
 }
 
 /// The portion of `FileBuilder` which is mutated while building the body of the file.
@@ -746,13 +796,14 @@ impl Slice {
     }
 
     fn wrap_video_sample_entry(&self, f: &File, r: Range<u64>, len: u64) -> Result<Chunk, Error> {
+        let data = &f.0.video_sample_entries[self.p()].1.data;
+        if u64::try_from(data.len()).unwrap() != len {
+            bail!(Internal, msg("expected len {} got len {}", len, data.len()));
+        }
         let mp4 = ARefss::new(f.0.clone());
         Ok(mp4
             .try_map(|mp4| {
                 let data = &mp4.video_sample_entries[self.p()].1.data;
-                if u64::try_from(data.len()).unwrap() != len {
-                    bail!(Internal, msg("expected len {} got len {}", len, data.len()));
-                }
                 Ok::<_, Error>(&data[r.start as usize..r.end as usize])
             })?
             .into())
@@ -915,6 +966,7 @@ impl FileBuilder {
             include_timestamp_subtitle_track: false,
             content_disposition: None,
             prev_media_duration_and_cur_runs: None,
+            filtered_samples: Vec::new(),
         }
     }
 
@@ -1012,6 +1064,153 @@ impl FileBuilder {
         Ok(())
     }
 
+    /// Pre-filters HEVC segments: strips in-band VPS/SPS/PPS NAL units from keyframes
+    /// so the bitstream matches what hvc1 promises (params only in hvcC box).
+    /// Must be called after all segments are appended but before computing metadata.
+    fn filter_hevc_segments(&mut self, db: &Arc<db::Database>) -> Result<(), Error> {
+        // Collect (segment_index, filtered_sizes, filtered_frames) for segments that
+        // need updating. We can't mutably index self.segments[i] while the for-loop
+        // holds an immutable borrow of self.segments, so we defer those writes.
+        let mut pending: Vec<(usize, Vec<u32>, Vec<FilteredFrame>)> = Vec::new();
+
+        for (i, segment) in self.segments.iter().enumerate() {
+            // Check if this segment's video sample entry is H.265 with hvc1 tag.
+            let vse_id = segment.s.video_sample_entry_id();
+            let is_hevc = self.video_sample_entries.iter().any(|e| {
+                e.0 == vse_id && e.1.data.len() >= 8 && &e.1.data[4..8] == b"hvc1"
+            });
+            if !is_hevc {
+                self.filtered_samples.push(None);
+                continue;
+            }
+
+            // Get the stream and sample file directory.
+            let stream_id = segment.s.id.stream();
+            let stream = match self.streams_by_id.get(&stream_id) {
+                Some(s) => s,
+                None => {
+                    self.filtered_samples.push(None);
+                    continue;
+                }
+            };
+            let locked = stream.inner.lock();
+            let pool = match locked.sample_file_dir.as_ref().map(|d| d.pool().clone()) {
+                Some(p) => p,
+                None => {
+                    self.filtered_samples.push(None);
+                    continue;
+                }
+            };
+            drop(locked);
+
+            // Read only the segment's byte range from the recording file.
+            let sample_range = segment.s.sample_file_range();
+            let file_path = pool.path().join(format!("{:016x}", segment.s.id.0));
+            let seg_len = (sample_range.end - sample_range.start) as usize;
+            let mut segment_data = vec![0u8; seg_len];
+            match std::fs::File::open(&file_path) {
+                Ok(mut f) => {
+                    use std::io::{Read, Seek, SeekFrom};
+                    if let Err(e) = f.seek(SeekFrom::Start(sample_range.start)) {
+                        debug!("failed to seek in {}: {}", file_path.display(), e);
+                        self.filtered_samples.push(None);
+                        continue;
+                    }
+                    if let Err(e) = f.read_exact(&mut segment_data) {
+                        debug!("failed to read from {}: {}", file_path.display(), e);
+                        self.filtered_samples.push(None);
+                        continue;
+                    }
+                }
+                Err(e) => {
+                    debug!("failed to open sample file {}: {}", file_path.display(), e);
+                    self.filtered_samples.push(None);
+                    continue;
+                }
+            };
+
+            // Iterate through frames and filter keyframes.
+            // `it.pos` is recording-absolute; subtract sample_range.start to get
+            // the offset into segment_data.
+            let seg_start = sample_range.start as usize;
+            let mut filtered_frames = Vec::new();
+            let mut filtered_sizes = Vec::new();
+            let db = db.clone();
+            let result = db.lock().with_recording_playback(
+                segment.s.id,
+                &mut |playback: &db::RecordingPlayback| {
+                    segment.s.foreach(playback, |it| {
+                        let frame_start = it.pos as usize - seg_start;
+                        let frame_bytes = it.bytes as usize;
+                        let frame_end = frame_start + frame_bytes;
+                        if frame_end > segment_data.len() {
+                            debug!("frame extends beyond segment data");
+                            filtered_frames.push(FilteredFrame {
+                                data: segment_data[frame_start..segment_data.len()].to_vec(),
+                                original_bytes: it.bytes,
+                            });
+                            filtered_sizes.push(segment_data.len() as u32 - frame_start as u32);
+                        } else if it.is_key() {
+                            let frame_data = &segment_data[frame_start..frame_end];
+                            let (filtered, removed) = strip_hevc_param_nals(frame_data);
+                            if removed > 0 {
+                                filtered_sizes.push(it.bytes - removed);
+                                filtered_frames.push(FilteredFrame {
+                                    data: filtered,
+                                    original_bytes: it.bytes,
+                                });
+                            } else {
+                                filtered_sizes.push(it.bytes);
+                                filtered_frames.push(FilteredFrame {
+                                    data: frame_data.to_vec(),
+                                    original_bytes: it.bytes,
+                                });
+                            }
+                        } else {
+                            filtered_sizes.push(it.bytes);
+                            filtered_frames.push(FilteredFrame {
+                                data: segment_data[frame_start..frame_end].to_vec(),
+                                original_bytes: it.bytes,
+                            });
+                        }
+                        Ok(())
+                    })
+                },
+            );
+            if let Err(e) = result {
+                debug!("failed to iterate frames for filtering: {}", e);
+                self.filtered_samples.push(None);
+                continue;
+            }
+
+            // Check if any bytes were actually removed.
+            let total_original: u64 = filtered_frames.iter().map(|f| f.original_bytes as u64).sum();
+            let total_filtered: u64 = filtered_frames.iter().map(|f| f.data.len() as u64).sum();
+            if total_filtered < total_original {
+                debug!(
+                    "HEVC filter: segment {} reduced from {} to {} bytes ({} removed)",
+                    segment.s.id,
+                    total_original,
+                    total_filtered,
+                    total_original - total_filtered
+                );
+                // Defer the mutable write — can't borrow self.segments mutably here.
+                pending.push((i, filtered_sizes, filtered_frames));
+                self.filtered_samples.push(None); // placeholder; overwritten below
+            } else {
+                self.filtered_samples.push(None);
+            }
+        }
+
+        // Apply deferred filtered_sample_sizes writes and fix up filtered_samples placeholders.
+        for (i, filtered_sizes, filtered_frames) in pending {
+            self.segments[i].filtered_sample_sizes = Some(filtered_sizes);
+            self.filtered_samples[i] = Some(filtered_frames);
+        }
+
+        Ok(())
+    }
+
     /// Builds the `File`, consuming the builder.
     pub fn build(mut self, db: Arc<db::Database>) -> Result<File, Error> {
         let mut max_end = None;
@@ -1079,6 +1278,11 @@ impl FileBuilder {
                 .err_kind(ErrorKind::Internal)?;
             etag.update(cursor.into_inner());
         }
+
+        // Pre-filter HEVC samples: strip in-band VPS/SPS/PPS NAL units from keyframes
+        // so the bitstream matches what hvc1 promises (params only in hvcC box).
+        self.filter_hevc_segments(&db)?;
+
         let max_end = match max_end {
             None => 0,
             Some(v) => v.unix_seconds(),
@@ -1169,14 +1373,20 @@ impl FileBuilder {
             content_disposition: self.content_disposition,
             prev_media_duration_and_cur_runs: self.prev_media_duration_and_cur_runs,
             type_: self.type_,
+            filtered_samples: self.filtered_samples,
         })))
     }
 
     fn append_mdat_contents(&mut self) -> Result<(), Error> {
         for (i, s) in self.segments.iter().enumerate() {
-            let r = s.s.sample_file_range();
+            let size = if let Some(Some(filtered)) = self.filtered_samples.get(i) {
+                filtered.iter().map(|f| f.data.len() as u64).sum::<u64>()
+            } else {
+                let r = s.s.sample_file_range();
+                r.end - r.start
+            };
             self.body
-                .append_slice(r.end - r.start, SliceType::VideoSampleData, i)?;
+                .append_slice(size, SliceType::VideoSampleData, i)?;
         }
         if let Some(p) = self.subtitle_co64_pos {
             BigEndian::write_u64(&mut self.body.buf[p..p + 8], self.body.slices.len());
@@ -1815,17 +2025,25 @@ struct FileInner {
     content_disposition: Option<HeaderValue>,
     prev_media_duration_and_cur_runs: Option<(recording::Duration, i32)>,
     type_: Type,
+    /// Per-segment filtered sample data for HEVC streams with in-band parameter sets.
+    /// `None` for segments that don't need filtering (non-HEVC or already clean).
+    filtered_samples: Vec<Option<Vec<FilteredFrame>>>,
 }
 
 impl FileInner {
     fn get_co64(&self, r: Range<u64>, l: u64) -> Result<Chunk, Error> {
         let mut v = Vec::with_capacity(l as usize);
         let mut pos = self.initial_sample_byte_pos;
-        for s in &self.segments {
+        for (i, s) in self.segments.iter().enumerate() {
             v.write_u64::<BigEndian>(pos)
                 .err_kind(ErrorKind::Internal)?;
-            let r = s.s.sample_file_range();
-            pos += r.end - r.start;
+            let seg_size = if let Some(Some(filtered)) = self.filtered_samples.get(i) {
+                filtered.iter().map(|f| f.data.len() as u64).sum::<u64>()
+            } else {
+                let r = s.s.sample_file_range();
+                r.end - r.start
+            };
+            pos += seg_size;
         }
         Ok(ARefss::new(v)
             .map(|v| &v[r.start as usize..r.end as usize])
@@ -1845,6 +2063,22 @@ impl FileInner {
     /// * `NotFound` if an old recording was deleted, the writer fell so far
     ///   behind it never opened the file at all, or the writer aborted.
     fn get_video_sample_data(&self, i: usize, r: Range<u64>) -> SliceStream {
+        // If we have pre-filtered data for this segment, serve from memory.
+        if let Some(Some(filtered)) = self.filtered_samples.get(i) {
+            // Concatenate all filtered frames into a single buffer.
+            let total_len: usize = filtered.iter().map(|f| f.data.len()).sum();
+            let mut buf = Vec::with_capacity(total_len);
+            for f in filtered {
+                buf.extend_from_slice(&f.data);
+            }
+            let start = r.start as usize;
+            let end = r.end as usize;
+            return SliceStream::Once(Some(Ok(
+                ARefss::new(buf).map(|b| &b[start..end]).into()
+            )));
+        }
+
+        // Otherwise, serve from disk/memory as before.
         let s = &self.segments[i];
         let stream_id = s.s.id.stream();
         let stream = self.streams_by_id.get(&stream_id).unwrap();
